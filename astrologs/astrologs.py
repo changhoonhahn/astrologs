@@ -16,7 +16,8 @@ class Astrologs(object):
         '''
         self._available_catalogs = {
                 'tinkergroup': [TinkerGroup, "Jeremy's Group Catalog"], 
-                'nsa': [NSAtlas, 'NASA-Sloan Atlas']
+                'nsa': [NSAtlas, 'NASA-Sloan Atlas'], 
+                'simsed': [SimSED, 'SEDs of simulations']
                 } 
         
         if catalog not in self._available_catalogs.keys(): 
@@ -37,6 +38,28 @@ class Astrologs(object):
 
         msg = "\n currently available catalogs:\n %s \n" % avail 
         print(msg)
+        return None 
+    
+    def select(self, selection): 
+        ''' selection a subset of the catalog based on selection criteria. This
+        automatically removes any data columns that do not match the selection
+        criteria dimensions so be careful. 
+
+        :param selection: 
+            Ngal dimensional boolean array specifying the galaxies you want to
+            select. 
+
+        '''
+        if np.sum(selection) == 0: 
+            raise ValueError("You're not keeping any galaxies") 
+        
+        Ndim = len(selection) 
+
+        for k in self.data.keys(): 
+            if self.data[k].shape[0] == Ndim: 
+                self.data[k] = self.data[k][selection] 
+            else: 
+                del self.data[k] 
         return None 
 
 
@@ -327,9 +350,9 @@ class NSAtlas(Catalog):
         des['M_g']          = ['mag', 'g-band absolute magnitude from k-corrections']
         cat['Dn4000']       = nsa['D4000'] 
         des['Dn4000']       = ['', 'Dn4000']
-        cat['M_star']       = nsa['MASS']
-        des['M_star']       = ['Msun/h^2', 'kcorrect stellar mass'] 
-        cat['log.M_star']   = np.log10(nsa['MASS'])
+        cat['M_star']       = nsa['MASS'] * 0.7**2 
+        des['M_star']       = ['Msun', 'kcorrect stellar mass'] 
+        cat['log.M_star']   = np.log10(cat['M_star'])
         des['log.M_star']   = ['dex', 'log stellar mass'] 
     
         if not silent: print('caluclating UV and Halpha based SFRs') 
@@ -453,3 +476,61 @@ class NSAtlas(Catalog):
 
         sfr = ha_flux.to(U.erg/U.s) /(10.**41.28)
         return sfr.value 
+
+
+class SimSED(Catalog):
+    ''' Catalogs with SEDs generated from SFH and ZH of simulated galaxies in
+    specified simulation 
+
+    '''
+    def __init__(self, sim=None): 
+        super().__init__()
+
+        if sim is None: 
+            self.options() 
+            raise ValueError('please specify kwarg `sim`') 
+
+        self.sim = sim 
+        self.file = self._File(self.sim) # name  
+
+    def options(self): 
+        msg = '\n'.join([
+            "",
+            "Galaxy formation simulation with SEDs constructed from SFH", 
+            "and ZH", 
+            "", 
+            "Specify the simulation using kwarg `sim`. The follow", 
+            "simulations are available:", 
+            "  `sim = 'simba'`", 
+            "  `sim = 'tng'`", 
+            "  `sim = 'eagle'`", 
+            ""])
+        print(msg)
+        return None 
+
+    def _File(self, sim): 
+        ''' file name of postprocessed catalog 
+        '''
+        if sim not in ['simba', 'tng', 'eagle']: 
+            self.options()
+            raise ValueError('kwarg `sim` provided is not one of the options') 
+
+        name = os.path.join(
+                os.environ.get('ASTROLOGS_DIR'), 
+                'simsed', 
+                'simsed.%s.hdf5' % sim)
+        return name 
+
+    def _construct(self, overwrite=False, silent=True): 
+        ''' these catalogs were constructed as part of the `galpopfm` project: 
+        https://github.com/IQcollaboratory/galpopFM/blob/68133cf04d97276284b32eec2eb26c05a3db1f38/run/_sed.py
+
+        todo
+        ----
+        * include metadata for the data columns 
+        '''
+        if not overwrite and os.path.isfile(self.file): 
+            print("%s already exists; to overwrite specify `overwrite=True`" % self.file) 
+            return None 
+        raise ValueError
+        return None 
