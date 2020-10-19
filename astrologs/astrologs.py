@@ -17,6 +17,7 @@ class Astrologs(object):
         self._available_catalogs = {
                 'tinkergroup': [TinkerGroup, "Jeremy's Group Catalog"], 
                 'nsa': [NSAtlas, 'NASA-Sloan Atlas'], 
+                'vagc': [VAGC, 'NYU Value-Added Catalog'], 
                 'simsed': [SimSED, 'SEDs of simulations']
                 } 
         
@@ -48,7 +49,6 @@ class Astrologs(object):
         :param selection: 
             Ngal dimensional boolean array specifying the galaxies you want to
             select. 
-
         '''
         if np.sum(selection) == 0: 
             raise ValueError("You're not keeping any galaxies") 
@@ -123,10 +123,15 @@ class Catalog(object):
         hdf5 = h5py.File(fhdf5, 'w') 
 
         for k in cat.keys(): 
-            if isinstance(cat[k], np.chararray): 
+            if isinstance(cat[k], np.chararray) or isinstance(cat[k][0], np.str_): 
                 hdf5.create_dataset(k, data=cat[k].astype(np.string_))
             else: 
-                hdf5.create_dataset(k, data=cat[k]) 
+                try: 
+                    hdf5.create_dataset(k, data=cat[k]) 
+                except TypeError:
+                    print(type(cat[k]))
+                    print(type(cat[k][0]))
+                    raise ValueError
         
         if meta is not None: 
             for k in meta.keys(): 
@@ -145,7 +150,7 @@ class TinkerGroup(Catalog):
     * https://cosmo.nyu.edu/~tinker/GROUP_FINDER/PCA_CATALOGS/
     * https://cosmo.nyu.edu/~tinker/GROUP_FINDER/PCA_CATALOGS/info.txt
     '''
-    def __init__(self, mlim=None): 
+    def __init__(self, mlim=None, cross_nsa=False): 
         super().__init__()
 
         if mlim is None: 
@@ -153,7 +158,8 @@ class TinkerGroup(Catalog):
             raise ValueError('please specify kwarg `mlim`') 
 
         self.mlim = mlim  
-        self.file = self._File(self.mlim) # name  
+        self.cross_nsa = cross_nsa 
+        self.file = self._File() # name  
 
     def options(self): 
         msg = '\n'.join([
@@ -171,17 +177,18 @@ class TinkerGroup(Catalog):
         print(msg)
         return None 
 
-    def _File(self, mlim): 
+    def _File(self): 
         ''' file name of postprocessed catalog 
         '''
-        if mlim not in ['9.7', '10.1', '10.5']: 
+        if self.mlim not in ['9.7', '10.1', '10.5']: 
             self.options()
             raise ValueError('kwarg `mlim` provided is not one of the options') 
 
         name = os.path.join(
                 os.environ.get('ASTROLOGS_DIR'), 
                 'tinkergroup', 
-                'tinker.groups.pca.M%s.hdf5' % mlim) 
+                'tinker.groups.pca.M%s%s.hdf5' % (self.mlim, ['', '.cross_nsa'][self.cross_nsa])
+                )
         return name 
 
     def _construct(self, overwrite=False, silent=True): 
@@ -273,13 +280,13 @@ class TinkerGroup(Catalog):
         des['H_delta_EW']   = ['', 'H_delta EW MPAJHU'] 
         cat['log.ssfr']     = logSSFR
         des['log.ssfr']     = ['dex', 'MPAJHU but using kcorrect M*']
-        cat['M_star']       = Ms
-        des['M_star']       = ['Msun/h^2', 'kcorrect stellar mass'] 
-        cat['log.M_star']   = np.log10(Ms)
+        cat['M_star']       = Ms * 0.7**2
+        des['M_star']       = ['Msun', 'kcorrect stellar mass'] 
+        cat['log.M_star']   = np.log10(cat['M_star'])
         des['log.M_star']   = ['dex', 'log stellar mass'] 
-        cat['ra']           = ra
+        cat['ra']           = ra * (180. / np.pi) 
         des['ra']           = ['deg', 'right ascension'] 
-        cat['dec']          = dec
+        cat['dec']          = dec * (180. / np.pi) 
         des['dec']          = ['deg', 'declination'] 
         cat['vdisp']        = vdisp 
         des['vdisp']        = ['km/s', 'velocity dispersion from VAGC']
@@ -287,7 +294,191 @@ class TinkerGroup(Catalog):
         des['s2n']          = ['', 'signal-to-noise of spectrum from VAGC'] 
         cat['sersic']       = sersic
         des['sersic']       = ['', 'sersic index from VAGC'] 
+
+        if self.cross_nsa: 
+            from astropy import units as U
+            from pydl.pydlutils.spheregroup import spherematch
+
+            # read NSA
+            nsa = Astrologs('nsa')
+
+            # now lets spherematch VAGC with NSA with 3'' match length
+            match_length = (3 * U.arcsec).to(U.degree).value
+            m_nsa, m_vagc, dmatch = spherematch(
+                    nsa.data['ra'], nsa.data['dec'],
+                    cat['ra'], cat['dec'],
+                    match_length, maxmatch=0)
+            if not silent: 
+                print('%i of %i VAGC galaxies have NSA matches' % 
+                        (len(m_vagc), len(cat['ra'])))
         
+            i_nsa = np.zeros(len(ra)).astype(int)
+            for i in range(len(cat['ra'])):
+                targ = (m_vagc == i)
+                if np.sum(targ) > 1:
+                    zmatch = (np.abs(nsa.data['redshift'][m_nsa[targ]] - cat['redshift'][i]) < 0.001)
+                    i_nsa[i] = m_nsa[targ][zmatch][0]
+                elif np.sum(targ) == 0:
+                    i_nsa[i] = -999
+                else:
+                    i_nsa[i] = m_nsa[targ]
+            hasmatch = (i_nsa != -999) 
+
+            for name in nsa.data.keys(): 
+                nsa_col_data = nsa.data[name]
+
+                if 'S' in str(nsa_col_data.dtype):
+                    blank = np.array(['-999'])
+                    blank.astype(nsa_col_data.dtype)
+                else:
+                    blank = np.array([-999.])
+                    blank.astype(nsa_col_data.dtype)
+
+                empty_shape = list(nsa_col_data.shape)
+                empty_shape[0] = len(cat['ra']) 
+                empty = np.tile(blank[0], empty_shape)
+                empty[hasmatch] = nsa_col_data[i_nsa[hasmatch]]
+                
+                cat['NSA_%s' % name] = empty 
+                des['NSA_%s' % name] = nsa.meta[name]
+                des['NSA_%s' % name][1] = 'from NSA; '+des['NSA_%s' % name][1]
+        
+        # save to hdf5 
+        self._save_to_hdf5(cat, self.file, meta=des, silent=silent)     
+        return None 
+
+
+class VAGC(Catalog): 
+    ''' NYU-VAGC DR72/bright/34/lss. Parent catalog of Jeremy's group catalog
+
+    references
+    ----------
+    * http://sdss.physics.nyu.edu/lss/dr72/bright/34/lss/
+    '''
+    def __init__(self, cross_nsa=False): 
+        super().__init__()
+        self.cross_nsa = cross_nsa
+        self.file = self._File() # name  
+
+    def options(self): 
+        msg = '\n'.join([
+            "",
+            "NYU-VAGC of SDSS DR7: DR72BRIGHT34 sample", 
+            ""])
+        print(msg)
+        return None 
+
+    def _File(self): 
+        ''' file name of postprocessed catalog 
+        '''
+        name = os.path.join(
+                os.environ.get('ASTROLOGS_DIR'), 'vagc', 
+                'vagc.dr72bright34%s.hdf5' % ['', '.cross_nsa'][self.cross_nsa]) 
+        return name 
+
+    def _construct(self, overwrite=False, silent=True): 
+        ''' construct postprocessed catalog from the ascii files described in
+        http://sdss.physics.nyu.edu/lss/dr72/bright/34/lss/README.dr72bright34
+        '''
+        if not overwrite and os.path.isfile(self.file): 
+            print("%s already exists; to overwrite specify `overwrite=True`" % self.file) 
+            return None 
+
+        # lss catalog
+        flss    = os.path.join(os.path.dirname(self.file), 'lss.dr72bright34.dat') 
+        # photometric data
+        fphoto  = os.path.join(os.path.dirname(self.file),
+                'photoinfo.dr72bright34.dat') 
+        # vmax data 
+        fvmax   = os.path.join(os.path.dirname(self.file),
+                'vmax.dr72bright34.dat') 
+
+        # read the data 
+        ra, dec, cz = np.loadtxt(flss, unpack=True, usecols=[3, 4, 5]) 
+
+        Mu, Mg, Mr, Mi, Mz, mu_50, r50_r90 = np.loadtxt(fphoto, unpack=True,
+                usecols=[1, 2, 3, 4, 5, 6, 7]) 
+
+        vmax, zmin, zmax = np.loadtxt(fvmax, unpack=True, usecols=[1, 2, 3]) 
+
+        cat, des = {}, {} 
+        cat['ra']           = ra 
+        des['ra']           = ['deg', 'right ascension'] 
+        cat['dec']          = dec
+        des['dec']          = ['deg', 'declination'] 
+        cat['cz']           = cz
+        des['cz']           = ['km/s', 'c * redshift'] 
+        cat['redshift']     = cz/2.998e5
+        des['redshift']     = ['', 'redshift'] 
+        cat['M_u']          = Mu
+        des['M_u']          = ['mag', 'u-band absolute magnitude kcorrected to z=0.1']
+        cat['M_g']          = Mg
+        des['M_g']          = ['mag', 'g-band absolute magnitude kcorrected to z=0.1']
+        cat['M_r']          = Mr
+        des['M_r']          = ['mag', 'r-band absolute magnitude kcorrected to z=0.1']
+        cat['M_i']          = Mi
+        des['M_i']          = ['mag', 'i-band absolute magnitude kcorrected to z=0.1']
+        cat['M_z']          = Mz
+        des['M_z']          = ['mag', 'z-band absolute magnitude kcorrected to z=0.1']
+        cat['mu_50']        = mu_50
+        des['mu_50']        = ['', 'r-band half-light Petrosian surface brightness, (1+z)^4- and K-corrected']
+        cat['r50_r90']      = r50_r90
+        des['r50_r90']      = ['', 'inverse concentration parameter'] 
+        cat['vmax']         = vmax 
+        des['vmax']         = ['', 'total volume over which this galaxy is observable']
+        cat['zmin']         = zmin
+        des['zmin']         = ['', 'min redshift observable for a galaxy with absmag']
+        cat['zmax']         = zmax 
+        des['zmax']         = ['', 'max redshift observable for a galaxy with absmag']
+    
+        if self.cross_nsa:  
+            from astropy import units as U
+            from pydl.pydlutils.spheregroup import spherematch
+
+            # read NSA
+            nsa = Astrologs('nsa')
+
+            # now lets spherematch VAGC with NSA with 3'' match length
+            match_length = (3 * U.arcsec).to(U.degree).value
+            m_nsa, m_vagc, dmatch = spherematch(
+                    nsa.data['ra'], nsa.data['dec'],
+                    cat['ra'], cat['dec'],
+                    match_length, maxmatch=0)
+            if not silent: 
+                print('%i of %i VAGC galaxies have NSA matches' % 
+                        (len(m_vagc), len(cat['ra'])))
+        
+            i_nsa = np.zeros(len(ra)).astype(int)
+            for i in range(len(cat['ra'])):
+                targ = (m_vagc == i)
+                if np.sum(targ) > 1:
+                    zmatch = (np.abs(nsa.data['redshift'][m_nsa[targ]] - cat['redshift'][i]) < 0.001)
+                    i_nsa[i] = m_nsa[targ][zmatch][0]
+                elif np.sum(targ) == 0:
+                    i_nsa[i] = -999
+                else:
+                    i_nsa[i] = m_nsa[targ]
+            hasmatch = (i_nsa != -999) 
+
+            for name in nsa.data.keys(): 
+                nsa_col_data = nsa.data[name]
+
+                if 'S' in str(nsa_col_data.dtype):
+                    blank = np.array(['-999'])
+                    blank.astype(nsa_col_data.dtype)
+                else:
+                    blank = np.array([-999.])
+                    blank.astype(nsa_col_data.dtype)
+
+                empty_shape = list(nsa_col_data.shape)
+                empty_shape[0] = len(cat['ra']) 
+                empty = np.tile(blank[0], empty_shape)
+                empty[hasmatch] = nsa_col_data[i_nsa[hasmatch]]
+                
+                cat['NSA_%s' % name] = empty 
+                des['NSA_%s' % name] = nsa.meta[name]
+                des['NSA_%s' % name][1] = 'from NSA; '+des['NSA_%s' % name][1]
+
         # save to hdf5 
         self._save_to_hdf5(cat, self.file, meta=des, silent=silent)     
         return None 
@@ -300,14 +491,18 @@ class NSAtlas(Catalog):
     ----------
     * http://nsatlas.org/data
     '''
-    def __init__(self): 
+    def __init__(self, vagc_footprint=False): 
         super().__init__()
+
+        self.vagc_footprint = vagc_footprint 
         self.file = self._File() # name  
 
     def options(self): 
         msg = '\n'.join([
             "",
             "NASA-Sloan Atlas where we relabel a handful of commonly used columns", 
+            "if kwarg `vagc_footprint=True`, then only keep nsa objects within", 
+            "the VAGC footprint.", 
             ""])
         print(msg)
         return None 
@@ -316,7 +511,8 @@ class NSAtlas(Catalog):
         ''' file name of postprocessed catalog 
         '''
         name = os.path.join(
-                os.environ.get('ASTROLOGS_DIR'), 'nsa', 'nsa.hdf5') 
+                os.environ.get('ASTROLOGS_DIR'), 'nsa', 
+                'nsa%s.hdf5' % ['', '.vagc_footprint'][self.vagc_footprint]) 
         return name 
 
     def _construct(self, overwrite=False, silent=True): 
@@ -366,6 +562,30 @@ class NSAtlas(Catalog):
         des['sfr_ha'] = ['Msun/yr', 'Halpha SFR'] 
         cat['log.sfr_ha'] = np.log10(sfr_ha) 
         des['log.sfr_ha'] = ['dex', 'log( Halpha SFR )'] 
+
+        if self.vagc_footprint: 
+            # read sdss vagc polygon with bright star mask removed 
+            f_vagcfootprint = os.path.join(os.environ.get('ASTROLOGS_DIR'),
+                    'nsa', 'vagc_footprint.npy')
+
+            if not os.path.isfile(f_vagcfootprint): 
+                from pydl.pydlutils import mangle
+                vagc_poly = mangle.read_fits_polygons(
+                        os.path.join(os.environ.get('ASTROLOGS_DIR'),
+                            'vagc', 'lss_combmask.dr72.fits'))
+                in_footprint, _ = mangle.is_in_window(
+                        vagc_poly, 
+                        np.array([cat['ra'], cat['dec']]).T
+                        )
+                np.save(f_vagcfootprint, in_footprint)
+            else: 
+                in_footprint = np.load(f_vagcfootprint)
+            if not silent: 
+                print("%i of %i NSA objects are in the SDSS VAGC footprint" %
+                        (np.sum(in_footprint), len(in_footprint)))
+
+            for k in cat.keys():
+                cat[k] = cat[k][in_footprint]
 
         # save to hdf5 
         self._save_to_hdf5(cat, self.file, meta=des, silent=silent)     
