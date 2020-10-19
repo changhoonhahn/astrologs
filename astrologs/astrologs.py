@@ -84,7 +84,7 @@ class Catalog(object):
         ''' load postprocessed hdf5 catalog into dictionary 
         '''
         if not os.path.isfile(self.file): 
-            raise ValueError('%s does not exist') 
+            raise ValueError('%s does not exist' % self.file) 
 
         return self._hdf5_to_dict(self.file) 
 
